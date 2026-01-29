@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -13,12 +13,102 @@ use crossbeam_channel::{Receiver, Sender, TrySendError};
 use crate::backend::{create_default_h264_decoder, H264Decoder};
 use crate::mp4::{EncodedSample, Mp4H264Source};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PixelFormat {
+    /// 8-bit RGBA (R,G,B,A in memory order).
+    Rgba8,
+    /// 8-bit BGRA (B,G,R,A in memory order).
+    Bgra8,
+}
+
+/// Frame payload bytes.
+///
+/// Some backends (notably macOS VideoToolbox) can allocate multi-megabyte
+/// buffers per frame. Repeated allocations can cause RSS growth due to allocator
+/// behavior. `FrameData` optionally carries a pool handle so the buffer can be
+/// recycled on drop, keeping memory stable.
+#[derive(Debug)]
+pub struct FrameData {
+    buf: Vec<u8>,
+    pool: Option<Arc<parking_lot::Mutex<Vec<Vec<u8>>>>>,
+    pool_cap: usize,
+}
+
+impl FrameData {
+    pub fn new(buf: Vec<u8>) -> Self {
+        Self {
+            buf,
+            pool: None,
+            pool_cap: 0,
+        }
+    }
+
+    pub fn with_pool(
+        buf: Vec<u8>,
+        pool: Arc<parking_lot::Mutex<Vec<Vec<u8>>>>,
+        pool_cap: usize,
+    ) -> Self {
+        Self {
+            buf,
+            pool: Some(pool),
+            pool_cap,
+        }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.buf
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.buf
+    }
+
+    /// Detach from the pool and return the owned `Vec<u8>`.
+    pub fn into_vec(mut self) -> Vec<u8> {
+        self.pool = None;
+        std::mem::take(&mut self.buf)
+    }
+}
+
+impl std::ops::Deref for FrameData {
+    type Target = [u8];
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl std::ops::DerefMut for FrameData {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.as_mut_slice()
+    }
+}
+
+impl Drop for FrameData {
+    fn drop(&mut self) {
+        let Some(pool) = self.pool.take() else { return; };
+        if self.pool_cap == 0 {
+            return;
+        }
+        // Return buffer to pool if there's room.
+        let mut g = pool.lock();
+        if g.len() < self.pool_cap {
+            let mut v = Vec::new();
+            std::mem::swap(&mut v, &mut self.buf);
+            g.push(v);
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct VideoFrame {
     pub width: u32,
     pub height: u32,
     pub pts_us: i64,
-    pub rgba: Vec<u8>,
+    pub format: PixelFormat,
+    /// Tight-packed pixel buffer.
+    ///
+    /// For `Rgba8` or `Bgra8`, length is `width * height * 4`.
+    pub data: FrameData,
 }
 
 pub struct VideoCore {
@@ -81,7 +171,7 @@ impl VideoCore {
     /// The renderer/player should decide what to present based on PTS.
     pub fn pump(&mut self) -> Result<()> {
         // Feed a bounded number of samples per pump to avoid monopolizing CPU.
-        const FEED_BUDGET: usize = 32;
+        const FEED_BUDGET: usize = 4;
 
         if !self.eof {
             for _ in 0..FEED_BUDGET {
@@ -107,7 +197,8 @@ impl VideoCore {
                 width: f.width,
                 height: f.height,
                 pts_us: f.pts_us,
-                rgba: f.rgba,
+                format: f.format,
+                data: f.data,
             });
         }
 
@@ -132,6 +223,7 @@ impl VideoCore {
     }
 }
 
+#[derive(Debug)]
 pub struct VideoStream {
     width: u32,
     height: u32,
@@ -143,6 +235,10 @@ pub struct VideoStream {
 
 impl VideoStream {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_options(path, VideoStreamOptions::default())
+    }
+
+    pub fn open_with_options(path: impl AsRef<Path>, opt: VideoStreamOptions) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
 
         let src = Mp4H264Source::open(&path).context("open mp4 source for config")?;
@@ -150,14 +246,84 @@ impl VideoStream {
         let height = src.config.height;
         drop(src);
 
-        // Larger buffer reduces producer/consumer phase mismatch.
-        let (tx, rx) = crossbeam_channel::bounded::<VideoFrame>(120);
+        let (tx, rx) = crossbeam_channel::bounded::<VideoFrame>(opt.channel_depth.max(1));
         let stop = Arc::new(AtomicBool::new(false));
         let finished = Arc::new(AtomicBool::new(false));
 
         let stop_t = stop.clone();
         let finished_t = finished.clone();
         let path_t = path.clone();
+
+        // Helper functions for PTS reordering.
+        // NOTE: these are plain functions (not closures) to avoid borrowing `reorder`
+        // mutably from multiple closures at the same time.
+        fn push_reorder(
+            reorder: &mut BTreeMap<i64, VecDeque<VideoFrame>>,
+            reorder_len: &mut usize,
+            opt: &VideoStreamOptions,
+            f: VideoFrame,
+        ) {
+            reorder.entry(f.pts_us).or_default().push_back(f);
+            *reorder_len += 1;
+
+            // Hard cap: if something goes wrong (consumer stalls, timestamps weird),
+            // never allow unbounded growth.
+            while *reorder_len > opt.reorder_max_frames {
+                let k = match reorder.keys().next().copied() {
+                    Some(k) => k,
+                    None => break,
+                };
+
+                let mut remove_key = false;
+                let dropped = {
+                    let q = match reorder.get_mut(&k) {
+                        Some(q) => q,
+                        None => break,
+                    };
+                    let dropped = q.pop_front().is_some();
+                    if q.is_empty() {
+                        remove_key = true;
+                    }
+                    dropped
+                };
+
+                if remove_key {
+                    reorder.remove(&k);
+                }
+
+                if dropped {
+                    *reorder_len = (*reorder_len).saturating_sub(1);
+                } else {
+                    // If we couldn't drop anything, stop to avoid spinning.
+                    break;
+                }
+            }
+        }
+
+        fn pop_next_ready(
+            reorder: &mut BTreeMap<i64, VecDeque<VideoFrame>>,
+            reorder_len: &mut usize,
+        ) -> Option<VideoFrame> {
+            let k = reorder.keys().next().copied()?;
+
+            let mut remove_key = false;
+            let f = {
+                let q = reorder.get_mut(&k)?;
+                let f = q.pop_front();
+                if q.is_empty() {
+                    remove_key = true;
+                }
+                f
+            };
+
+            if remove_key {
+                reorder.remove(&k);
+            }
+            if f.is_some() {
+                *reorder_len = (*reorder_len).saturating_sub(1);
+            }
+            f
+        }
 
         let join = thread::spawn(move || {
             let mut core = match VideoCore::open(&path_t) {
@@ -169,70 +335,102 @@ impl VideoStream {
                 }
             };
 
-            let mut pending_out: VecDeque<VideoFrame> = VecDeque::new();
+            // PTS reordering buffer: some decoders (depending on backend and flags)
+            // can output frames in decode order. For H.264 with B-frames, PTS is
+            // not monotonic in decode order. We reorder by PTS with a small window.
+            let mut reorder: BTreeMap<i64, VecDeque<VideoFrame>> = BTreeMap::new();
+            let mut reorder_len: usize = 0;
+            let mut started_at: Option<std::time::Instant> = None;
+            let mut base_pts_us: i64 = 0;
+
+            let mut pace_next = |pts_us: i64| {
+                if !opt.paced {
+                    return;
+                }
+                let now = std::time::Instant::now();
+                if started_at.is_none() {
+                    started_at = Some(now);
+                    base_pts_us = pts_us;
+                    return;
+                }
+                let delta_us = pts_us.saturating_sub(base_pts_us).max(0) as u64;
+                let target = started_at.unwrap() + Duration::from_micros(delta_us);
+                if target > now {
+                    // Sleep in small slices so we can still observe stop signals.
+                    let mut remaining = target.duration_since(now);
+                    while remaining > Duration::from_millis(5) {
+                        thread::sleep(Duration::from_millis(5));
+                        if stop_t.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        remaining = target.saturating_duration_since(std::time::Instant::now());
+                    }
+                    if remaining > Duration::from_micros(0) {
+                        thread::sleep(remaining);
+                    }
+                }
+            };
+
+            // `push_reorder`/`pop_next_ready` are plain fns (defined above).
 
             loop {
                 if stop_t.load(Ordering::Relaxed) {
                     break;
                 }
 
-                // 1) Flush pending_out to channel first (never drop).
-                while let Some(f) = pending_out.pop_front() {
-                    match tx.try_send(f) {
-                        Ok(()) => {}
-                        Err(TrySendError::Full(f)) => {
-                            pending_out.push_front(f);
-                            break;
-                        }
-                        Err(TrySendError::Disconnected(_)) => {
-                            finished_t.store(true, Ordering::Relaxed);
-                            return;
-                        }
+                // 1) Ensure we have a small amount of decoded frames buffered.
+                let want = opt.ahead_frames.max(opt.reorder_depth_frames);
+                while reorder_len < want {
+                    if let Err(e) = core.pump() {
+                        log::error!("video decode thread pump error: {e:?}");
+                        finished_t.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                    let mut produced_any = false;
+                    while let Some(frame) = core.pop_decoded() {
+                        produced_any = true;
+                        push_reorder(&mut reorder, &mut reorder_len, &opt, frame);
+                    }
+                    if !produced_any {
+                        break;
                     }
                 }
 
-                // If channel is full, do not pump more; let consumer catch up.
-                if !pending_out.is_empty() {
-                    thread::yield_now();
-                    continue;
-                }
+                // 2) Ship the next frame (paced) or idle.
+                // We wait until we have enough frames to safely reorder, unless at EOF.
+                let have_ready = reorder_len >= opt.reorder_depth_frames || core.is_finished();
+                if have_ready {
+                    if let Some(mut frame) = pop_next_ready(&mut reorder, &mut reorder_len) {
+                        pace_next(frame.pts_us);
 
-                // 2) Produce: feed decoder and drain decoded frames into core.stash.
-                if let Err(e) = core.pump() {
-                    log::error!("video decode thread pump error: {e:?}");
-                    finished_t.store(true, Ordering::Relaxed);
-                    return;
-                }
-
-                let mut produced_any = false;
-                while let Some(frame) = core.pop_decoded() {
-                    produced_any = true;
-                    pending_out.push_back(frame);
-                }
-
-                // 3) Immediately try to ship freshly produced frames.
-                while let Some(f) = pending_out.pop_front() {
-                    match tx.try_send(f) {
-                        Ok(()) => {}
-                        Err(TrySendError::Full(f)) => {
-                            pending_out.push_front(f);
+                        if stop_t.load(Ordering::Relaxed) {
                             break;
                         }
-                        Err(TrySendError::Disconnected(_)) => {
-                            finished_t.store(true, Ordering::Relaxed);
-                            return;
+
+                        // Try to send; if consumer is behind, drop frames (real-time).
+                        match tx.try_send(frame) {
+                            Ok(()) => {}
+                            Err(TrySendError::Full(f)) => {
+                                // Drop this frame to avoid unbounded latency.
+                                drop(f);
+                                thread::yield_now();
+                            }
+                            Err(TrySendError::Disconnected(_)) => {
+                                finished_t.store(true, Ordering::Relaxed);
+                                return;
+                            }
                         }
+                    } else {
+                        thread::sleep(Duration::from_millis(1));
                     }
+                } else {
+                    // No decoded frames available yet.
+                    thread::sleep(Duration::from_millis(1));
                 }
 
-                if core.is_finished() && pending_out.is_empty() {
+                if core.is_finished() && reorder_len == 0 {
                     finished_t.store(true, Ordering::Relaxed);
                     break;
-                }
-
-                // Avoid spinning when decoder has no output yet.
-                if !produced_any {
-                    thread::sleep(Duration::from_millis(1));
                 }
             }
         });
@@ -268,6 +466,34 @@ impl VideoStream {
 
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct VideoStreamOptions {
+    /// If true, the stream will pace frames according to PTS.
+    pub paced: bool,
+    /// Channel depth between decode thread and consumer.
+    pub channel_depth: usize,
+    /// How many decoded frames to keep buffered ahead.
+    pub ahead_frames: usize,
+
+    /// Reorder window (frames). If output PTS is already monotonic, this is harmless.
+    pub reorder_depth_frames: usize,
+
+    /// Hard cap to prevent unbounded memory growth due to timestamp/pathological cases.
+    pub reorder_max_frames: usize,
+}
+
+impl Default for VideoStreamOptions {
+    fn default() -> Self {
+        Self {
+            paced: true,
+            channel_depth: 8,
+            ahead_frames: 6,
+            reorder_depth_frames: 16,
+            reorder_max_frames: 64,
+        }
     }
 }
 

@@ -306,7 +306,7 @@ impl State {
                 let dt = frame.pts_us - self.last_presented_pts;
                 log::info!("present dt={}us", dt);
                 self.last_presented_pts = frame.pts_us;
-                self.upload_frame(&frame.rgba, frame.width, frame.height);
+                self.upload_frame(&frame.data, frame.width, frame.height);
             }
         }
 

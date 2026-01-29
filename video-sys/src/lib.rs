@@ -6,4 +6,4 @@ pub mod h264;
 pub mod mp4;
 pub mod pixel;
 
-pub use core::{VideoCore, VideoFrame, VideoStream};
+pub use core::{FrameData, PixelFormat, VideoCore, VideoFrame, VideoStream};

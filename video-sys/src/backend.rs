@@ -1,14 +1,17 @@
 use anyhow::{anyhow, Result};
 
+use crate::core::{FrameData, PixelFormat};
 use crate::h264::H264Config;
 use crate::mp4::EncodedSample;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct VideoFrame {
     pub width: u32,
     pub height: u32,
     pub pts_us: i64,
-    pub rgba: Vec<u8>,
+    pub format: PixelFormat,
+    /// Tight-packed pixels.
+    pub data: FrameData,
 }
 
 pub trait H264Decoder {

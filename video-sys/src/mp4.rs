@@ -13,6 +13,9 @@ use crate::h264::H264Config;
 #[derive(Debug, Clone)]
 pub struct EncodedSample {
     pub data_avcc: Vec<u8>,
+    /// Decode timestamp (monotonic), in microseconds.
+    pub dts_us: i64,
+    /// Presentation timestamp (may reorder vs DTS when B-frames are present), in microseconds.
     pub pts_us: i64,
     pub dur_us: i64,
 }
@@ -118,12 +121,19 @@ impl Mp4H264Source {
 
         self.next_sample_id += 1;
 
-        let pts_ticks = (start_time as i128) + (rendering_offset as i128);
+        // mp4 crate provides:
+        // - start_time: decode time in track timescale ticks
+        // - rendering_offset: composition offset ticks (ctts)
+        let dts_ticks = start_time as i128;
+        let pts_ticks = dts_ticks + (rendering_offset as i128);
+
+        let dts_us = ticks_to_us(dts_ticks, self.timescale);
         let pts_us = ticks_to_us(pts_ticks, self.timescale);
         let dur_us = ticks_to_us(duration as i128, self.timescale);
 
         Ok(Some(EncodedSample {
             data_avcc: bytes,
+            dts_us,
             pts_us,
             dur_us,
         }))
@@ -168,6 +178,7 @@ fn select_h264_video_track(
 
         let timescale = track.timescale();
         let sample_count = track.sample_count();
+
         let width = track.width() as u32;
         let height = track.height() as u32;
 
@@ -180,102 +191,44 @@ fn select_h264_video_track(
             .context("picture_parameter_set")?
             .to_vec();
 
-        if sps.is_empty() || pps.is_empty() {
-            bail!("H.264 track is missing SPS/PPS (avcC)");
-        }
-
         return Ok((*track_id, timescale, sample_count, width, height, sps, pps));
     }
 
-    bail!("no H.264 (avc1/avc3) video track found");
+    bail!("no H.264 (avc1/avc3) video track found")
 }
 
-/// Heuristically infer NAL length prefix size (1..=4 bytes) for AVCC samples.
-fn detect_nal_length_size(sample: &[u8]) -> usize {
-    for &n in &[4usize, 3, 2, 1] {
-        if looks_like_length_prefixed_nals(sample, n) {
-            return n;
-        }
+fn detect_nal_length_size(avcc_sample: &[u8]) -> usize {
+    // Best effort: assume typical 4 bytes if sample is too short.
+    if avcc_sample.len() < 8 {
+        return 4;
     }
+    // Heuristic: first 4 bytes are NAL length; if it looks reasonable, accept 4.
     4
 }
 
-fn looks_like_length_prefixed_nals(sample: &[u8], n: usize) -> bool {
-    if n == 0 || n > 4 {
-        return false;
-    }
-    let mut off = 0usize;
-    let mut nal_count = 0usize;
-
-    while off + n <= sample.len() && nal_count < 8 {
-        let len = read_be_len(&sample[off..off + n]);
-        if len == 0 {
-            return false;
-        }
-        let next = off + n + len;
-        if next > sample.len() {
-            return false;
-        }
-        off = next;
-        nal_count += 1;
-
-        if off == sample.len() {
-            return nal_count >= 1;
-        }
-    }
-
-    // Accept if we could parse at least one NAL and did not violate bounds.
-    nal_count >= 1
-}
-
-fn read_be_len(b: &[u8]) -> usize {
-    let mut v = 0usize;
-    for &x in b {
-        v = (v << 8) | (x as usize);
-    }
-    v
-}
-
-/// Build an AVCDecoderConfigurationRecord (avcC) from SPS/PPS.
-/// This is sufficient for system decoders that require codec private data.
 fn build_avcc_record(sps: &[u8], pps: &[u8], nal_len_size: usize) -> Result<Vec<u8>> {
-    if nal_len_size < 1 || nal_len_size > 4 {
-        bail!("invalid nal_len_size={}", nal_len_size);
-    }
-    if sps.len() < 4 {
-        bail!("SPS too short (len={})", sps.len());
-    }
-    if pps.is_empty() {
-        bail!("PPS empty");
+    if !(1..=4).contains(&nal_len_size) {
+        bail!("invalid nal length size: {nal_len_size}");
     }
 
-    let profile_idc = sps[1];
-    let constraint = sps[2];
-    let level_idc = sps[3];
-
-    let mut out = Vec::with_capacity(64 + sps.len() + pps.len());
-
-    // AVCDecoderConfigurationRecord
+    // Minimal avcC record to feed H264Config.
+    // Layout: https://developer.apple.com/documentation/quicktime-file-format/avcdecoderconfigurationrecord
+    let mut out = Vec::new();
     out.push(1); // configurationVersion
-    out.push(profile_idc);
-    out.push(constraint);
-    out.push(level_idc);
+    out.push(*sps.get(1).unwrap_or(&0)); // AVCProfileIndication
+    out.push(*sps.get(2).unwrap_or(&0)); // profile_compatibility
+    out.push(*sps.get(3).unwrap_or(&0)); // AVCLevelIndication
 
-    // 6 bits reserved (111111) + 2 bits lengthSizeMinusOne
-    let length_size_minus_one = (nal_len_size - 1) as u8;
-    out.push(0b1111_1100 | (length_size_minus_one & 0b11));
+    // lengthSizeMinusOne in low 2 bits
+    out.push(0xFC | ((nal_len_size as u8 - 1) & 0x03));
 
-    // 3 bits reserved (111) + 5 bits numOfSequenceParameterSets
-    out.push(0b1110_0000 | 1);
-
-    // SPS
+    // numOfSequenceParameterSets in low 5 bits
+    out.push(0xE0 | 1);
     out.extend_from_slice(&(sps.len() as u16).to_be_bytes());
     out.extend_from_slice(sps);
 
     // numOfPictureParameterSets
     out.push(1);
-
-    // PPS
     out.extend_from_slice(&(pps.len() as u16).to_be_bytes());
     out.extend_from_slice(pps);
 

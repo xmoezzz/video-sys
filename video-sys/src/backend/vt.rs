@@ -1,11 +1,13 @@
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ptr;
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
 use parking_lot::Mutex;
 
 use crate::backend::{H264Decoder, VideoFrame};
+use crate::core::{FrameData, PixelFormat};
 use crate::h264::H264Config;
 use crate::mp4::EncodedSample;
 use crate::pixel::nv12_to_rgba_strided;
@@ -49,6 +51,18 @@ struct CMSampleTimingInfo {
 
 type CFAllocatorRef = *const c_void;
 type CFDictionaryRef = *const c_void;
+type CFNumberRef = *const c_void;
+type CFStringRef = *const c_void;
+
+#[repr(C)]
+struct CFDictionaryKeyCallBacks {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+struct CFDictionaryValueCallBacks {
+    _private: [u8; 0],
+}
 
 type CMVideoFormatDescriptionRef = *mut c_void;
 type CMBlockBufferRef = *mut c_void;
@@ -65,10 +79,21 @@ const kVTDecodeFrame_EnableAsynchronousDecompression: VTDecodeFrameFlags = 1 << 
 
 const kCVPixelBufferLock_ReadOnly: u64 = 0x00000001;
 
+// OSType for BGRA.
+const kCVPixelFormatType_32BGRA: u32 = 0x4247_5241; // 'BGRA'
+
+// CFNumberType: kCFNumberSInt32Type = 3
+const kCFNumberSInt32Type: i32 = 3;
+
+// Keep the output queue bounded to prevent unbounded memory growth when the consumer stalls.
+const MAX_OUT_FRAMES: usize = 16;
+// Reuse a small number of big BGRA/RGBA buffers to keep RSS stable.
+const POOL_CAP: usize = 32;
+
 #[repr(C)]
 struct VTDecompressionOutputCallbackRecord {
     decompressionOutputCallback: Option<
-        extern "C" fn(
+        unsafe extern "C" fn(
             decompressionOutputRefCon: *mut c_void,
             sourceFrameRefCon: *mut c_void,
             status: OSStatus,
@@ -85,7 +110,7 @@ struct VTDecompressionOutputCallbackRecord {
 #[link(name = "CoreMedia", kind = "framework")]
 #[link(name = "CoreVideo", kind = "framework")]
 #[link(name = "CoreFoundation", kind = "framework")]
-extern "C" {
+unsafe extern "C" {
     fn CMVideoFormatDescriptionCreateFromH264ParameterSets(
         allocator: CFAllocatorRef,
         parameterSetCount: usize,
@@ -148,11 +173,31 @@ extern "C" {
 
     fn CFRelease(cf: *const c_void);
 
+    // CoreFoundation helpers for imageBufferAttributes
+    static kCFTypeDictionaryKeyCallBacks: CFDictionaryKeyCallBacks;
+    static kCFTypeDictionaryValueCallBacks: CFDictionaryValueCallBacks;
+
+    fn CFNumberCreate(allocator: CFAllocatorRef, theType: i32, valuePtr: *const c_void) -> CFNumberRef;
+
+    fn CFDictionaryCreate(
+        allocator: CFAllocatorRef,
+        keys: *const *const c_void,
+        values: *const *const c_void,
+        numValues: isize,
+        keyCallBacks: *const CFDictionaryKeyCallBacks,
+        valueCallBacks: *const CFDictionaryValueCallBacks,
+    ) -> CFDictionaryRef;
+
+    // CoreVideo constants
+    static kCVPixelBufferPixelFormatTypeKey: CFStringRef;
+
     fn CVPixelBufferLockBaseAddress(pixelBuffer: CVPixelBufferRef, lockFlags: u64) -> OSStatus;
     fn CVPixelBufferUnlockBaseAddress(pixelBuffer: CVPixelBufferRef, lockFlags: u64) -> OSStatus;
     fn CVPixelBufferGetPlaneCount(pixelBuffer: CVPixelBufferRef) -> usize;
     fn CVPixelBufferGetBaseAddressOfPlane(pixelBuffer: CVPixelBufferRef, planeIndex: usize) -> *mut c_void;
     fn CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer: CVPixelBufferRef, planeIndex: usize) -> usize;
+    fn CVPixelBufferGetBaseAddress(pixelBuffer: CVPixelBufferRef) -> *mut c_void;
+    fn CVPixelBufferGetBytesPerRow(pixelBuffer: CVPixelBufferRef) -> usize;
     fn CVPixelBufferGetWidth(pixelBuffer: CVPixelBufferRef) -> usize;
     fn CVPixelBufferGetHeight(pixelBuffer: CVPixelBufferRef) -> usize;
     fn CVPixelBufferGetPixelFormatType(pixelBuffer: CVPixelBufferRef) -> u32;
@@ -160,9 +205,18 @@ extern "C" {
 
 struct CallbackCtx {
     queue: Mutex<VecDeque<VideoFrame>>,
+    pool: Arc<parking_lot::Mutex<Vec<Vec<u8>>>>,
 }
 
-extern "C" fn vt_output_cb(
+fn bgra_to_rgba_inplace(p: &mut [u8]) {
+    // BGRA -> RGBA by swapping B and R.
+    // Layout per pixel: [B, G, R, A]
+    for px in p.chunks_exact_mut(4) {
+        px.swap(0, 2);
+    }
+}
+
+unsafe extern "C" fn vt_output_cb(
     decompressionOutputRefCon: *mut c_void,
     _sourceFrameRefCon: *mut c_void,
     status: OSStatus,
@@ -188,8 +242,39 @@ extern "C" fn vt_output_cb(
         let planes = CVPixelBufferGetPlaneCount(pb);
         let fmt = CVPixelBufferGetPixelFormatType(pb);
 
-        // Expect NV12-like bi-planar YUV (420v or 420f).
-        if planes >= 2 {
+        let mut out: Option<(PixelFormat, FrameData)> = None;
+
+        // Preferred: BGRA (single-plane).
+        if planes == 0 && fmt == kCVPixelFormatType_32BGRA {
+            let base = CVPixelBufferGetBaseAddress(pb) as *const u8;
+            let stride = CVPixelBufferGetBytesPerRow(pb);
+            if !base.is_null() {
+                let need = (width as usize) * (height as usize) * 4;
+                // Acquire a buffer from the pool (or allocate).
+                let mut buf = {
+                    let mut g = ctx.pool.lock();
+                    g.pop().unwrap_or_else(|| vec![0u8; need])
+                };
+                buf.resize(need, 0u8);
+                let row_bytes = (width as usize) * 4;
+
+                for y in 0..(height as usize) {
+                    let src = base.add(y * stride);
+                    let dst = buf.as_mut_ptr().add(y * row_bytes);
+                    ptr::copy_nonoverlapping(src, dst, row_bytes);
+                }
+
+                // Keep the public contract consistent: output RGBA.
+                bgra_to_rgba_inplace(&mut buf);
+                out = Some((
+                    PixelFormat::Rgba8,
+                    FrameData::with_pool(buf, ctx.pool.clone(), POOL_CAP),
+                ));
+            }
+        }
+
+        // Fallback: NV12 (bi-planar).
+        if out.is_none() && planes >= 2 {
             let y_ptr = CVPixelBufferGetBaseAddressOfPlane(pb, 0) as *const u8;
             let uv_ptr = CVPixelBufferGetBaseAddressOfPlane(pb, 1) as *const u8;
             let y_stride = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
@@ -201,17 +286,32 @@ extern "C" fn vt_output_cb(
                 let y = std::slice::from_raw_parts(y_ptr, y_len);
                 let uv = std::slice::from_raw_parts(uv_ptr, uv_len);
 
-                let rgba = nv12_to_rgba_strided(width, height, y_stride, uv_stride, y, uv);
-
-                ctx.queue.lock().push_back(VideoFrame {
-                    width,
-                    height,
-                    pts_us: presentationTimeStamp.to_us(),
-                    rgba,
-                });
+                out = Some((
+                    PixelFormat::Rgba8,
+                    FrameData::new(nv12_to_rgba_strided(
+                        width,
+                        height,
+                        y_stride,
+                        uv_stride,
+                        y,
+                        uv,
+                    )),
+                ));
             }
-        } else {
-            let _ = fmt;
+        }
+
+        if let Some((format, data)) = out {
+            let mut q = ctx.queue.lock();
+            while q.len() >= MAX_OUT_FRAMES {
+                q.pop_front();
+            }
+            q.push_back(VideoFrame {
+                width,
+                height,
+                pts_us: presentationTimeStamp.to_us(),
+                format,
+                data,
+            });
         }
 
         let _ = CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
@@ -251,11 +351,15 @@ impl VtH264Decoder {
             )
         };
         if st != 0 || format_desc.is_null() {
-            bail!("CMVideoFormatDescriptionCreateFromH264ParameterSets failed: status={}", st);
+            bail!(
+                "CMVideoFormatDescriptionCreateFromH264ParameterSets failed: status={}",
+                st
+            );
         }
 
         let ctx = Box::new(CallbackCtx {
             queue: Mutex::new(VecDeque::new()),
+            pool: Arc::new(Mutex::new(Vec::new())),
         });
         let ctx_ptr = Box::into_raw(ctx);
 
@@ -264,17 +368,56 @@ impl VtH264Decoder {
             decompressionOutputRefCon: ctx_ptr as *mut c_void,
         };
 
+        // Request BGRA output to avoid NV12 conversion overhead on CPU.
+        let bgra = kCVPixelFormatType_32BGRA as i32;
+        let num = unsafe { CFNumberCreate(ptr::null(), kCFNumberSInt32Type, &bgra as *const _ as *const c_void) };
+        if num.is_null() {
+            unsafe {
+                CFRelease(format_desc as *const _);
+                drop(Box::from_raw(ctx_ptr));
+            }
+            bail!("CFNumberCreate failed");
+        }
+
+        let keys: [*const c_void; 1] = [unsafe { kCVPixelBufferPixelFormatTypeKey as *const c_void }];
+        let vals: [*const c_void; 1] = [num as *const c_void];
+        let dict = unsafe {
+            CFDictionaryCreate(
+                ptr::null(),
+                keys.as_ptr(),
+                vals.as_ptr(),
+                1,
+                &kCFTypeDictionaryKeyCallBacks as *const _,
+                &kCFTypeDictionaryValueCallBacks as *const _,
+            )
+        };
+
+        if dict.is_null() {
+            unsafe {
+                CFRelease(num);
+                CFRelease(format_desc as *const _);
+                drop(Box::from_raw(ctx_ptr));
+            }
+            bail!("CFDictionaryCreate failed");
+        }
+
         let mut session: VTDecompressionSessionRef = ptr::null_mut();
         let st = unsafe {
             VTDecompressionSessionCreate(
                 ptr::null(),
                 format_desc,
                 ptr::null(),
-                ptr::null(),
+                dict,
                 &cb as *const _,
                 &mut session as *mut _,
             )
         };
+
+        unsafe {
+            CFRelease(num);
+            CFRelease(dict as *const _);
+        }
+
         if st != 0 || session.is_null() {
             unsafe {
                 CFRelease(format_desc as *const _);
@@ -346,10 +489,13 @@ impl H264Decoder for VtH264Decoder {
             bail!("CMBlockBufferReplaceDataBytes failed: status={}", st);
         }
 
+        // IMPORTANT:
+        // - decodeTimeStamp must be DTS (monotonic)
+        // - presentationTimeStamp must be PTS
         let timing = CMSampleTimingInfo {
             duration: CMTime::from_us(sample.dur_us.max(0)),
             presentationTimeStamp: CMTime::from_us(sample.pts_us.max(0)),
-            decodeTimeStamp: CMTime::from_us(sample.pts_us.max(0)),
+            decodeTimeStamp: CMTime::from_us(sample.dts_us.max(0)),
         };
         let sample_size = sample.data_avcc.len();
 
