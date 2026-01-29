@@ -3,6 +3,9 @@ name = "video-sys"
 version = "0.1.0"
 edition = "2024"
 license = "MPL-2.0"
+description = "A cross-platform video decoding and playback library in Rust."
+repository = "https://github.com/xmoezzz/video-sys"
+keywords = ["video", "playback", "cross-platform"]
 
 [dependencies]
 anyhow = "1"
